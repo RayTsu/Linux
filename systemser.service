@@ -1,0 +1,10 @@
+[Unit]
+Description={{service_name}}
+After=network.target
+
+[Service]
+ExecStart=/root/run/{{service_name}}.sh start
+ExecStop=/root/run/{{service_name}}.sh stop
+
+[Install]
+WantedBy=multi-user.target
