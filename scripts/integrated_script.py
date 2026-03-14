@@ -39,18 +39,18 @@ NODES = [
 ZABBIX_CONFIG = {
     "sz": {
         "url": "http://10.10.0.22/zabbix/api_jsonrpc.php",
-        "user": "Admin",
-        "password": "zabbix"
+        "user": "xxxx",
+        "password": "xxxx"
     },
     "dg": {
         "url": "http://10.20.4.10/zabbix/api_jsonrpc.php",
-        "user": "Admin",
-        "password": "zabbix"
+        "user": "xxxx",
+        "password": "xxxx"
     }
 }
 
-SSH_USER = "nas_monitor"
-SSH_PASS = "Aa_123456"
+SSH_USER = "xxxx"
+SSH_PASS = "xxxx"
 
 # 特殊节点的磁盘监控项前缀映射
 SPECIAL_DISK_PREFIX = {
