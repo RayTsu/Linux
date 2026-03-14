@@ -8,14 +8,14 @@ import json
 import re
 
 class WindowsMonitor:
-    def __init__(self, host, username='zabbix_monitor', password='Aa_123456', port=5985):
+    def __init__(self, host, username='xxxx', password='xxxx', port=5985):
         """
         初始化Windows监控器
 
         Args:
             host: Windows机器IP或主机名
-            username: 用户名 (默认: zabbix_monitor)
-            password: 密码 (默认: Aa_123456)
+            username: 用户名 (默认: xxxx)
+            password: 密码 (默认: xxxx)
             port: WinRM端口 (默认5985 HTTP, 5986 HTTPS)
         """
         self.host = host
