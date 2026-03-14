@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import requests
+import paramiko
+import json
+import pandas as pd
+from typing import Optional, Dict, List, Any
+import time
+import re
+
+# ==================== 配置信息 ====================
+NODES = [
+    {"type": "pgsql", "ip": "10.10.0.85", "purpose": "用户、认证中心数据库", "data_dir": "/", "disk_type": "本地", "real_path": ""},
+    {"type": "pgsql", "ip": "10.10.0.93", "purpose": "iEIS数据库", "data_dir": "/iEIS-PG/pgdata", "disk_type": "nas", "real_path": "/var/lib/docker/volumes/iEIS-PG/_data"},
+    {"type": "pgsql", "ip": "10.10.0.120", "purpose": "mes数据库-固态盘", "data_dir": "/citus/pgdata/", "disk_type": "nas", "real_path": "/var/lib/docker/volumes/postgres_nas-163/_data"},
+    {"type": "pgsql", "ip": "10.10.0.120", "purpose": "mes数据库-机械盘", "data_dir": "/volume1/Prod1/pgdata/", "disk_type": "nas", "real_path": "/var/lib/docker/volumes/postgres_nas-vol1/_data"},
+    {"type": "mssql", "ip": "10.10.0.39", "purpose": "贴片机取数数据库", "data_dir": "D盘", "disk_type": "本地", "real_path": ""},
+    {"type": "mssql", "ip": "10.10.0.43", "purpose": "生产sqlserver服务器", "data_dir": "E盘", "disk_type": "nas", "real_path": ""},
+    {"type": "redis", "ip": "10.10.0.140", "purpose": "redis服务器", "data_dir": "/prod/redis-data", "disk_type": "nas", "real_path": "/var/lib/docker/volumes/rmq-redis-etcd_nas-redis-163/_data"},
+    {"type": "rocketmq", "ip": "10.10.0.140", "purpose": "rocketmq服务器", "data_dir": "/prod/rmq-data/", "disk_type": "nas", "real_path": "/var/lib/docker/volumes/rmq-redis-etcd_nas-rmqbroker-163/_data"},
+    {"type": "redis", "ip": "10.10.2.159", "purpose": "IM redis服务器", "data_dir": "/", "disk_type": "本地", "real_path": ""},
+    {"type": "pgsql", "ip": "10.20.4.6", "purpose": "东莞mes数据库", "data_dir": "/volume1/PG/data1", "disk_type": "nas", "real_path": "/var/lib/docker/volumes/pg_sc_data/_data"},
+    {"type": "mssql", "ip": "10.20.4.7", "purpose": "东莞mes数据库", "data_dir": "E盘", "disk_type": "本地", "real_path": ""},
+]
+
+ZABBIX_CONFIG = {
+    "sz": {
+        "url": "http://10.10.0.22/zabbix/api_jsonrpc.php",
+        "user": "Admin",
+        "password": "zabbix"
+    },
+    "dg": {
+        "url": "http://10.20.4.10/zabbix/api_jsonrpc.php",
+        "user": "Admin",
+        "password": "zabbix"
+    }
+}
+
+SSH_USER = "nas_monitor"
+SSH_PASS = "Aa_123456"
+
+# 特殊节点的磁盘监控项前缀映射
+SPECIAL_DISK_PREFIX = {
+    "10.20.4.7": "vfs.fs.dependent.size",  # 东莞mes数据库
+    # 其他特殊节点可继续添加
+}
+# 默认磁盘前缀
+DEFAULT_DISK_PREFIX = "vfs.fs.size"
+
+# ==================== Zabbix API客户端 ====================
+class ZabbixClient:
+    def __init__(self, url: str, user: str, password: str):
+        self.url = url
+        self.auth = None
+        self.login(user, password)
+
+    def login(self, user: str, password: str):
+        data = {
+            "jsonrpc": "2.0",
+            "method": "user.login",
+            "params": {
+                "username": user,
+                "password": password
+            },
+            "id": 1
+        }
+        resp = requests.post(self.url, json=data, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+        if 'result' in result:
+            self.auth = result['result']
+        else:
+            raise Exception(f"Zabbix登录失败: {result.get('error')}")
+
+    def call(self, method: str, params: dict) -> dict:
+        data = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "auth": self.auth,
+            "id": 1
+        }
+        resp = requests.post(self.url, json=data, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_host_id(self, ip: str) -> Optional[str]:
+        """通过IP查找主机ID"""
+        result = self.call("host.get", {
+            "filter": {"ip": ip},
+            "output": ["hostid"]
+        })
+        if result.get('result'):
+            return result['result'][0]['hostid']
+        result = self.call("host.get", {
+            "filter": {"host": ip},
+            "output": ["hostid"]
+        })
+        if result.get('result'):
+            return result['result'][0]['hostid']
+        return None
+
+    def get_item_value(self, host_id: str, key_pattern: str) -> Optional[str]:
+        """获取匹配key的监控项最新值"""
+        result = self.call("item.get", {
+            "hostids": host_id,
+            "search": {"key_": key_pattern},
+            "output": ["itemid", "key_", "lastvalue", "name"],
+            "sortfield": "itemid",
+            "limit": 1
+        })
+        if result.get('result'):
+            return result['result'][0]['lastvalue']
+        return None
+
+# ==================== SSH工具 ====================
+def ssh_exec(host: str, command: str) -> Optional[str]:
+    """通过SSH执行命令，返回标准输出"""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(host, username=SSH_USER, password=SSH_PASS, timeout=15)
+        stdin, stdout, stderr = client.exec_command(command)
+        output = stdout.read().decode('utf-8').strip()
+        error = stderr.read().decode('utf-8').strip()
+        if error:
+            print(f"[SSH] {host} 错误: {error}")
+        return output
+    except Exception as e:
+        print(f"[SSH] {host} 连接失败: {e}")
+        return None
+    finally:
+        client.close()
+
+def get_linux_disk_usage_ssh(host: str, path: str) -> Dict[str, str]:
+    """通过sudo df获取指定路径的磁盘使用情况"""
+    cmd = f"sudo df -h {path} | awk 'NR==2 {{print $5, $2, $3, $4}}'"
+    output = ssh_exec(host, cmd)
+    if output:
+        parts = output.split()
+        if len(parts) >= 4:
+            return {
+                "usage": parts[0],        # 使用率百分比
+                "total": parts[1],         # 总大小（保留以备可能）
+                "used": parts[2],           # 已用大小
+                "free": parts[3]             # 可用大小（暂不使用）
+            }
+    return {}
+
+# ==================== 工具函数 ====================
+def _format_bytes(bytes_val: float) -> str:
+    """将字节转换为可读格式"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024.0:
+            return f"{bytes_val:.2f}{unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.2f}PB"
+
+# ==================== 主逻辑 ====================
+def main():
+    # 初始化Zabbix客户端
+    zabbix_sz = ZabbixClient(**ZABBIX_CONFIG["sz"])
+    zabbix_dg = ZabbixClient(**ZABBIX_CONFIG["dg"])
+
+    results = []
+
+    for node in NODES:
+        ip = node["ip"]
+        node_type = node["type"]
+        purpose = node["purpose"]
+        data_dir = node["data_dir"]
+        disk_type = node["disk_type"]
+        real_path = node.get("real_path", "")
+
+        print(f"正在处理 {ip} ({purpose})...")
+
+        # 选择Zabbix服务器
+        if ip.startswith("10.10."):
+            zapi = zabbix_sz
+        elif ip.startswith("10.20."):
+            zapi = zabbix_dg
+        else:
+            print(f"未知IP段: {ip}")
+            continue
+
+        # 获取主机ID
+        host_id = zapi.get_host_id(ip)
+        if not host_id:
+            print(f"⚠️ 在Zabbix中未找到主机 {ip}，无法获取CPU/内存数据")
+            cpu = mem = None
+        else:
+            # 根据操作系统类型获取CPU和内存
+            if node_type in ("pgsql", "redis", "rocketmq"):  # Linux
+                # CPU: system.cpu.util[,idle] -> 使用率 = 100 - 空闲率
+                cpu_key = "system.cpu.util[,idle]"
+                cpu_idle = zapi.get_item_value(host_id, cpu_key)
+                if cpu_idle:
+                    cpu = 100 - float(cpu_idle)
+                else:
+                    print(f"⚠️ Zabbix中未找到 {ip} 的CPU使用率监控项: {cpu_key}")
+                    cpu = None
+                # 内存: vm.memory.utilization
+                mem_key = "vm.memory.utilization"
+                mem_item = zapi.get_item_value(host_id, mem_key)
+                if mem_item:
+                    mem = float(mem_item)
+                else:
+                    print(f"⚠️ Zabbix中未找到 {ip} 的内存使用率监控项: {mem_key}")
+                    mem = None
+            else:  # Windows (mssql)
+                # CPU: system.cpu.util
+                cpu_key = "system.cpu.util"
+                cpu_item = zapi.get_item_value(host_id, cpu_key)
+                if cpu_item:
+                    cpu = float(cpu_item)
+                else:
+                    print(f"⚠️ Zabbix中未找到 {ip} 的CPU使用率监控项: {cpu_key}")
+                    cpu = None
+                # 内存: vm.memory.util (可计算项，直接取值)
+                mem_key = "vm.memory.util"
+                mem_item = zapi.get_item_value(host_id, mem_key)
+                if mem_item:
+                    mem = float(mem_item)
+                else:
+                    print(f"⚠️ Zabbix中未找到 {ip} 的内存使用率监控项: {mem_key}")
+                    mem = None
+
+        # 获取磁盘信息：仅关注"磁盘使用率"和"磁盘已用"
+        disk_usage = None
+        disk_used = None
+
+        # 判断是否通过SSH获取（仅限Linux且有真实挂载路径）
+        if node_type in ("pgsql", "redis", "rocketmq") and real_path:
+            ssh_disk = get_linux_disk_usage_ssh(ip, real_path)
+            if ssh_disk:
+                disk_usage = ssh_disk.get("usage")
+                disk_used = ssh_disk.get("used")
+            else:
+                print(f"⚠️ SSH获取磁盘信息失败 {ip}:{real_path}")
+        else:
+            # 通过Zabbix获取磁盘信息（所有其他情况）
+            if host_id:
+                # 确定磁盘key的前缀（根据不同IP可能不同）
+                disk_prefix = SPECIAL_DISK_PREFIX.get(ip, DEFAULT_DISK_PREFIX)
+                if node_type == "mssql":
+                    # Windows磁盘，提取盘符 "D盘" -> "D:"
+                    drive_letter = data_dir[0].upper() + ":"
+                    # 磁盘使用率
+                    usage_key = f"{disk_prefix}[{drive_letter},pused]"
+                    usage_item = zapi.get_item_value(host_id, usage_key)
+                    if usage_item:
+                        disk_usage = f"{float(usage_item):.2f}%"
+                    else:
+                        print(f"⚠️ Zabbix中未找到 {ip} 的磁盘使用率监控项: {usage_key}")
+                    # 磁盘已用大小
+                    used_key = f"{disk_prefix}[{drive_letter},used]"
+                    used_item = zapi.get_item_value(host_id, used_key)
+                    if used_item:
+                        disk_used = _format_bytes(float(used_item))
+                    else:
+                        print(f"⚠️ Zabbix中未找到 {ip} 的磁盘已用监控项: {used_key}")
+                else:
+                    # Linux本地磁盘
+                    usage_key = f"{disk_prefix}[{data_dir},pused]"
+                    usage_item = zapi.get_item_value(host_id, usage_key)
+                    if usage_item:
+                        disk_usage = f"{float(usage_item):.2f}%"
+                    else:
+                        print(f"⚠️ Zabbix中未找到 {ip} 的磁盘使用率监控项: {usage_key}")
+                    used_key = f"{disk_prefix}[{data_dir},used]"
+                    used_item = zapi.get_item_value(host_id, used_key)
+                    if used_item:
+                        disk_used = _format_bytes(float(used_item))
+                    else:
+                        print(f"⚠️ Zabbix中未找到 {ip} 的磁盘已用监控项: {used_key}")
+            else:
+                print(f"⚠️ 主机 {ip} 无Zabbix数据，无法获取磁盘信息")
+
+        # 组装结果（已移除真实挂载路径）
+        result = {
+            "数据库/中间件类型": node_type,
+            "IP地址": ip,
+            "用途": purpose,
+            "数据目录": data_dir,
+            "CPU使用率": f"{cpu:.2f}%" if cpu is not None else "N/A",
+            "内存使用率": f"{mem:.2f}%" if mem is not None else "N/A",
+            "磁盘使用率": disk_usage if disk_usage is not None else "N/A",
+            "磁盘已用": disk_used if disk_used is not None else "N/A",
+            "磁盘类型": disk_type
+        }
+        results.append(result)
+        time.sleep(0.5)
+
+    # 创建DataFrame并调整列顺序（磁盘类型放最后）
+    df = pd.DataFrame(results)
+    columns = ["数据库/中间件类型", "IP地址", "用途", "数据目录",
+               "CPU使用率", "内存使用率", "磁盘使用率", "磁盘已用", "磁盘类型"]
+    df = df[columns]
+
+    # 输出表格到控制台
+    print("\n=== 监控数据汇总 ===")
+    print(df.to_string(index=False))
+
+    # 生成带样式的HTML
+    html_content = df.to_html(index=False, escape=False)
+    styled_html = f"""
+    <html>
+    <head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            font-family: 'Microsoft YaHei', Arial, sans-serif;
+            margin: 20px;
+        }}
+        table {{
+            border-collapse: collapse;
+            width: 100%;
+            border: 1px solid #000000;
+        }}
+        th {{
+            background-color: #90EE90; /* 浅绿色 */
+            text-align: center;
+            font-weight: bold;
+            border: 1px solid #000000;
+            padding: 8px;
+        }}
+        td {{
+            text-align: left;
+            border: 1px solid #000000;
+            padding: 6px;
+        }}
+    </style>
+    </head>
+    <body>
+    <h2>数据库/中间件监控报告</h2>
+    {html_content}
+    </body>
+    </html>
+    """
+
+    # 保存HTML报告
+    with open("monitor_report.html", "w", encoding="utf-8") as f:
+        f.write(styled_html)
+    print("\n报告已保存至 monitor_report.html (带样式)")
+
+if __name__ == "__main__":
+    main()
+============================================
+3、  使用虚拟环境运行脚本
+
+# 1. 安装 python3-venv（如果尚未安装）
+sudo apt update
+sudo apt install python3-venv
+
+# 2. 创建虚拟环境（在脚本所在目录或任意位置）
+python3 -m venv monitor_env
+
+# 3. 激活虚拟环境
+source monitor_env/bin/activate
+
+# 4. 升级 pip（可选但推荐）
+pip install --upgrade pip
+
+# 5. 安装所需依赖
+pip install requests paramiko pandas
+
+# 6. 运行巡检脚本
+python monitor.py
+
+# 7. 输入 deactivate 即可退出虚拟环境
+
+# 8. 通过浏览器访问
+启动HTTP 服务器远程访问
+# Python 3
+python3 -m http.server 8000
+http://10.10.2.191:8000/monitor_report.html
+       
+          
